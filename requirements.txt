@@ -1,7 +1,0 @@
-streamlit
-numpy
-pandas
-plotly
-scipy
-tensorflow-cpu
-protobuf
