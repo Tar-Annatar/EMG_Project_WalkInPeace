@@ -47,7 +47,7 @@ LOGO_PATH = find_logo_path()
 # PAGE CONFIG + GREEN THEME
 # ─────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="NeuroGait EMG Monitor",
+    page_title="WalkInPeace EMG Monitor",
     page_icon=LOGO_PATH or "🟢",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -147,7 +147,7 @@ def _hash(pw: str) -> str:
 # values pulled from st.secrets["credentials"] instead of hardcoding.
 DEFAULT_USERS = {
     "demo": _hash("emg2026"),
-    "clinician": _hash("neurogait"),
+    "clinician": _hash("WalkInPeace"),
 }
 
 def get_user_db():
@@ -165,9 +165,9 @@ def login_page():
         lcol1, lcol2, lcol3 = st.columns([1, 1, 1])
         with lcol2:
             st.image(LOGO_PATH, use_container_width=True)
-        st.markdown('<h2 class="login-title">NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
     else:
-        st.markdown('<h2 class="login-title">🟢 NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">🟢 WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
     st.markdown('<div class="login-sub">Sign in to access the live EMG dashboard</div>', unsafe_allow_html=True)
 
     with st.form("login_form"):
@@ -314,9 +314,9 @@ if LOGO_PATH:
     with hcol1:
         st.image(LOGO_PATH, use_container_width=True)
     with hcol2:
-        st.title("NeuroGait — Live EMG Pathology & Freeze-of-Gait Monitor")
+        st.title("WalkInPeace — Live EMG Pathology & Freeze-of-Gait Monitor")
 else:
-    st.title("🟢 NeuroGait — Live EMG Pathology & Freeze-of-Gait Monitor")
+    st.title("🟢 WalkInPeace — Live EMG Pathology & Freeze-of-Gait Monitor")
 status_placeholder = st.empty()
 
 # ─────────────────────────────────────────────────────────────────────────
