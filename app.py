@@ -43,7 +43,7 @@ LOGO_PATH = find_logo_path()
 # PAGE CONFIG + THEME
 # ─────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="NeuroGait EMG Monitor",
+    page_title="WalkInPeace EMG Monitor",
     page_icon=LOGO_PATH or "🧠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -172,7 +172,7 @@ def _hash(pw: str) -> str:
 
 DEFAULT_USERS = {
     "demo": _hash("emg2026"),
-    "clinician": _hash("neurogait"),
+    "clinician": _hash("WalkInPeace"),
 }
 
 def get_user_db():
@@ -190,9 +190,9 @@ def login_page():
         lcol1, lcol2, lcol3 = st.columns([1, 1, 1])
         with lcol2:
             st.image(LOGO_PATH, use_container_width=True)
-        st.markdown('<h2 class="login-title">NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
     else:
-        st.markdown('<h2 class="login-title">🧠 NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">🧠 WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
     st.markdown('<div class="login-sub">Sign in to access the live EMG dashboard</div>', unsafe_allow_html=True)
 
     with st.form("login_form"):
@@ -325,7 +325,7 @@ with st.sidebar:
         report_csv = b""
     st.download_button(
         "⬇ Download report", data=report_csv,
-        file_name="neurogait_session_report.csv", mime="text/csv",
+        file_name="WalkInPeace_session_report.csv", mime="text/csv",
         disabled=not has_data, use_container_width=True,
         help="Download this session's predictions as a CSV report." if has_data
              else "Play or run the example first to generate a report.",
@@ -341,13 +341,13 @@ if LOGO_PATH:
     with hcol2:
         st.markdown(
             '<div class="app-header"><div><p class="kicker">Real-time neuromuscular monitoring</p>'
-            '<h1>NeuroGait — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
+            '<h1>WalkInPeace — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
             unsafe_allow_html=True,
         )
 else:
     st.markdown(
         '<div class="app-header"><div><p class="kicker">Real-time neuromuscular monitoring</p>'
-        '<h1>🧠 NeuroGait — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
+        '<h1>🧠 WalkInPeace — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
         unsafe_allow_html=True,
     )
 status_placeholder = st.empty()
