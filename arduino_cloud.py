@@ -1,3 +1,12 @@
+"""
+Minimal, robust Arduino IoT Cloud REST client.
+
+- OAuth2 client-credentials token flow (cached until near-expiry)
+- Reads the latest value of a Thing property ("last_value")
+- decode_emg_batch() never raises; it returns None on any malformed/missing
+  data so the caller can safely treat it as "waiting for next batch".
+"""
+import base64
 import json
 import time
 
@@ -8,22 +17,21 @@ TOKEN_URL = "https://api2.arduino.cc/iot/v1/clients/token"
 API_BASE = "https://api2.arduino.cc/iot/v2"
 
 
-class ArduinoCloudError(RuntimeError):
+class ArduinoCloudError(Exception):
+    """Raised for any Arduino IoT Cloud auth/network/response failure."""
     pass
 
 
 class ArduinoCloudClient:
-    """Thin wrapper around the Arduino IoT Cloud REST API (client-credentials
-    OAuth2 flow). One instance = one cached access token, refreshed as needed."""
-
-    def __init__(self, client_id: str, client_secret: str):
+    def __init__(self, client_id: str, client_secret: str, timeout: float = 8.0):
         self.client_id = client_id
         self.client_secret = client_secret
+        self.timeout = timeout
         self._token = None
-        self._token_expiry = 0.0
+        self._token_exp = 0.0
 
     def _get_token(self) -> str:
-        if self._token and time.time() < self._token_expiry - 30:
+        if self._token and time.time() < self._token_exp - 30:
             return self._token
         try:
             resp = requests.post(
@@ -34,74 +42,88 @@ class ArduinoCloudClient:
                     "client_secret": self.client_secret,
                     "audience": "https://api2.arduino.cc/iot",
                 },
-                timeout=10,
+                timeout=self.timeout,
             )
             resp.raise_for_status()
+            data = resp.json()
+            self._token = data["access_token"]
+            self._token_exp = time.time() + float(data.get("expires_in", 300))
+            return self._token
         except requests.RequestException as e:
-            raise ArduinoCloudError(f"Could not authenticate with Arduino Cloud: {e}") from e
-        data = resp.json()
-        self._token = data["access_token"]
-        self._token_expiry = time.time() + float(data.get("expires_in", 3600))
-        return self._token
+            raise ArduinoCloudError(f"Auth failed: {e}") from e
+        except (KeyError, ValueError) as e:
+            raise ArduinoCloudError(f"Auth response malformed: {e}") from e
 
-    def _headers(self):
-        return {"Authorization": f"Bearer {self._get_token()}"}
+    def get_property_value(self, thing_id: str, variable_name: str):
+        if not (thing_id and variable_name):
+            raise ArduinoCloudError("Thing ID and variable name are required.")
+        token = self._get_token()
+        try:
+            resp = requests.get(
+                f"{API_BASE}/things/{thing_id}/properties",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            props = resp.json()
+        except requests.RequestException as e:
+            raise ArduinoCloudError(f"Cloud request failed: {e}") from e
+        except ValueError as e:
+            raise ArduinoCloudError(f"Bad response from cloud: {e}") from e
 
-    def list_things(self):
-        r = requests.get(f"{API_BASE}/things", headers=self._headers(), timeout=10)
-        r.raise_for_status()
-        return r.json()
+        if not isinstance(props, list):
+            raise ArduinoCloudError("Unexpected response format from Arduino Cloud.")
 
-    def get_properties(self, thing_id: str):
-        r = requests.get(
-            f"{API_BASE}/things/{thing_id}/properties",
-            headers=self._headers(), timeout=10,
-        )
-        if r.status_code == 404:
-            raise ArduinoCloudError(f"Thing '{thing_id}' not found (check the Thing ID).")
-        r.raise_for_status()
-        return r.json()
-
-    def get_property_value(self, thing_id: str, property_name: str):
-        """Latest value of one named Cloud Variable on a Thing."""
-        props = self.get_properties(thing_id)
         for p in props:
-            if p.get("name") == property_name:
+            if isinstance(p, dict) and p.get("name") == variable_name:
                 return p.get("last_value")
-        raise ArduinoCloudError(
-            f"No variable named '{property_name}' on this Thing. "
-            f"Available: {[p.get('name') for p in props]}"
-        )
+
+        raise ArduinoCloudError(f"Variable '{variable_name}' not found on this Thing.")
 
 
-def decode_emg_batch(raw_value, n_channels: int = 8):
+def decode_emg_batch(raw_value, n_channels: int):
     """
-    Parse the JSON payload pushed by the Arduino sketch into a
-    (n_channels, n_samples) float32 array.
-
-    Expected shape from the sketch: {"n": 50, "ch": [[...ch1...], [...ch2...], ...]}
-    Also accepts a flat list (interpreted channel-major) as a fallback.
-    Returns None if the payload can't be decoded as a batch (e.g. it's the
-    device's placeholder value on first boot).
+    Decode a raw property value into an (n_channels, n_samples) float32 array.
+    Accepts: None, JSON array string, python list, or base64-encoded float32 bytes.
+    Never raises — returns None for missing/malformed data so callers can treat
+    that as "waiting for next batch" instead of crashing.
     """
-    if raw_value is None or isinstance(raw_value, (int, float, bool)):
+    if raw_value is None:
         return None
     try:
-        payload = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    if isinstance(payload, dict) and "ch" in payload:
-        arr = np.array(payload["ch"], dtype=np.float32)
-    elif isinstance(payload, list):
-        arr = np.array(payload, dtype=np.float32)
-        if arr.ndim == 1:
-            if arr.size % n_channels != 0:
+        data = raw_value
+        if isinstance(data, str):
+            s = data.strip()
+            if not s:
                 return None
-            arr = arr.reshape(n_channels, -1)
-    else:
-        return None
+            try:
+                data = json.loads(s)
+            except ValueError:
+                try:
+                    buf = base64.b64decode(s, validate=True)
+                    data = np.frombuffer(buf, dtype=np.float32)
+                except Exception:
+                    return None
 
-    if arr.ndim != 2 or arr.shape[0] != n_channels:
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.size == 0:
+            return None
+
+        if arr.ndim == 1:
+            n_samples = arr.size // n_channels
+            if n_samples < 1:
+                return None
+            arr = arr[: n_samples * n_channels].reshape(n_samples, n_channels).T
+        elif arr.ndim == 2:
+            if arr.shape[0] == n_channels:
+                pass
+            elif arr.shape[1] == n_channels:
+                arr = arr.T
+            else:
+                return None
+        else:
+            return None
+
+        return np.ascontiguousarray(arr, dtype=np.float32)
+    except Exception:
         return None
-    return arr
