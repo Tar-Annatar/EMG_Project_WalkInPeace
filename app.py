@@ -308,43 +308,18 @@ with st.sidebar:
         st.rerun()
 
     st.markdown('<div class="sidebar-section-title">Data Source</div>', unsafe_allow_html=True)
-
+    
     source = st.radio(
         "Source Mode",
         ["Synthetic Demo", "Arduino Cloud (IoT)"],
         key="source_mode",
+        label_visibility="collapsed",
     )
 
-    st.write("Current source:", source)   # <-- temporary debug line
-
     scenario, inject_freeze, freeze_at = CONDITION_NAMES[0], False, None
+    ard_client_id, ard_client_secret, ard_thing_id, ard_var_name, ard_poll_s = "", "", "", "emgBatch", 0.5
 
     if source == "Synthetic Demo":
-        st.success("Synthetic selected")
-
-        scenario = st.selectbox(
-            "Simulated condition",
-            CONDITION_NAMES
-        )
-
-        if scenario == "Parkinson's / FOG risk":
-            inject_freeze = st.checkbox(
-                "Include a freeze-of-gait event",
-                value=True
-            )
-
-            if inject_freeze:
-                freeze_at = st.slider(
-                    "Freeze occurs at (s)",
-                    10,
-                    60,
-                    25
-                )
-
-    else:
-        st.success("Arduino selected")
-
-        st.markdown("## 📡 Arduino Connector")
         st.markdown('<div class="sidebar-section-title">Try a scenario</div>', unsafe_allow_html=True)
         scenario = st.selectbox("Simulated condition", CONDITION_NAMES)
         if scenario == "Parkinson's / FOG risk":
@@ -485,8 +460,13 @@ if play_clicked:
             st.session_state.running = False
             st.session_state.arduino_status = "Disconnected"
         else:
-            st.session_state.arduino_client = ArduinoCloudClient(ard_client_id, ard_client_secret)
-            st.session_state.arduino_status = "Polling"
+            try:
+                st.session_state.arduino_client = ArduinoCloudClient(ard_client_id, ard_client_secret)
+                st.session_state.arduino_status = "Polling"
+            except Exception as e:
+                status_placeholder.error(f"Could not start Arduino client: {e}")
+                st.session_state.running = False
+                st.session_state.arduino_status = "Disconnected"
 
 if example_clicked:
     st.session_state.extractor = StreamingFeatureExtractor()
@@ -689,6 +669,12 @@ def _live_tick():
         chunk = st.session_state.streamer.generate_chunk(chunk_samples)
     else:  # Arduino Cloud
         client = st.session_state.arduino_client
+        if client is None:
+            status_placeholder.error("Arduino client not initialized. Click Play again.")
+            st.session_state.running = False
+            st.session_state.arduino_status = "Disconnected"
+            render_dashboard()
+            return
         try:
             raw_val = client.get_property_value(ard_thing_id, ard_var_name)
             chunk = decode_emg_batch(raw_val, n_channels=N_CHANNELS)
@@ -705,6 +691,16 @@ def _live_tick():
                 return
         except ArduinoCloudError as e:
             status_placeholder.markdown(f'<span class="badge badge-error">{e}</span>', unsafe_allow_html=True)
+            st.session_state.running = False
+            st.session_state.arduino_status = "Disconnected"
+            render_dashboard()
+            return
+        except Exception as e:
+            # Catch-all so an unexpected error from the connector never crashes the fragment
+            status_placeholder.markdown(
+                f'<span class="badge badge-error">Unexpected Arduino error: {e}</span>',
+                unsafe_allow_html=True,
+            )
             st.session_state.running = False
             st.session_state.arduino_status = "Disconnected"
             render_dashboard()
