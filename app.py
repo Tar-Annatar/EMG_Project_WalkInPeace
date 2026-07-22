@@ -308,18 +308,43 @@ with st.sidebar:
         st.rerun()
 
     st.markdown('<div class="sidebar-section-title">Data Source</div>', unsafe_allow_html=True)
-    
+
     source = st.radio(
         "Source Mode",
         ["Synthetic Demo", "Arduino Cloud (IoT)"],
         key="source_mode",
-        label_visibility="collapsed",
     )
 
+    st.write("Current source:", source)   # <-- temporary debug line
+
     scenario, inject_freeze, freeze_at = CONDITION_NAMES[0], False, None
-    ard_client_id, ard_client_secret, ard_thing_id, ard_var_name, ard_poll_s = "", "", "", "emgBatch", 0.5
 
     if source == "Synthetic Demo":
+        st.success("Synthetic selected")
+
+        scenario = st.selectbox(
+            "Simulated condition",
+            CONDITION_NAMES
+        )
+
+        if scenario == "Parkinson's / FOG risk":
+            inject_freeze = st.checkbox(
+                "Include a freeze-of-gait event",
+                value=True
+            )
+
+            if inject_freeze:
+                freeze_at = st.slider(
+                    "Freeze occurs at (s)",
+                    10,
+                    60,
+                    25
+                )
+
+    else:
+        st.success("Arduino selected")
+
+        st.markdown("## 📡 Arduino Connector")
         st.markdown('<div class="sidebar-section-title">Try a scenario</div>', unsafe_allow_html=True)
         scenario = st.selectbox("Simulated condition", CONDITION_NAMES)
         if scenario == "Parkinson's / FOG risk":
