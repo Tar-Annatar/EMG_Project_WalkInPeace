@@ -1,16 +1,16 @@
 """
-EMG Pathology & Freeze-of-Gait Monitor — Streamlit App (public demo build)
-============================================================================
-Public-facing version: no model upload, no normalization file upload, no
-CSV/Arduino data sources. Just a live synthetic demo with Play / Pause /
-Stop, a downloadable session report, an "Example" one-click run, and the
-live stats dashboard.
+EMG Pathology & Freeze-of-Gait Monitor — Streamlit App
+=======================================================
+Public-facing version: Synthetic demo & live Arduino Cloud IoT connection.
+Includes live status badges, manual connection tester, session report export,
+and real-time ML dashboard.
 
 Run locally:
     streamlit run app.py
 """
 
 import os
+import time
 import hashlib
 from io import BytesIO
 
@@ -23,10 +23,11 @@ from signal_utils import (
     FS, N_CHANNELS, CONDITION_NAMES, TTF_MAX,
     StreamingFeatureExtractor, RunningNormalizer, SyntheticEMGStreamer,
 )
+from arduino_cloud import ArduinoCloudClient, ArduinoCloudError, decode_emg_batch
 
-MAX_LOG_LEN = 1000       # cap prediction history so "Full session" can't grow unbounded
-DEFAULT_SPEED = 1.0       # fixed playback speed (real-time)
-DEFAULT_CHUNK_MS = 150    # fixed update interval
+MAX_LOG_LEN = 1000       # Cap prediction history for smooth browser performance
+DEFAULT_SPEED = 1.0       # Fixed playback speed
+DEFAULT_CHUNK_MS = 150    # Fixed update interval
 
 # ─────────────────────────────────────────────────────────────────────────
 # LOGO
@@ -148,13 +149,13 @@ div.stDownloadButton > button:hover { background:#0d9488; transform: translateY(
 .badge-paused { background:#f1f5f9; color:#475569; }
 .badge-demo   { background:#fef3c7; color:#92400e; }
 .badge-error  { background:#fee2e2; color:#b91c1c; }
+.badge-iot    { background:#e0e7ff; color:#3730a3; }
 
 /* Panel container around charts */
 .panel {
     background: var(--surface); border:1px solid var(--border);
     border-radius:16px; padding: 6px 6px 2px 6px; margin-bottom:16px;
     box-shadow: 0 1px 3px rgba(15,23,42,0.04);
-    transition: opacity 0.15s ease;
 }
 </style>
 """
@@ -189,7 +190,7 @@ def login_page():
     if LOGO_PATH:
         lcol1, lcol2, lcol3 = st.columns([1, 1, 1])
         with lcol2:
-            st.image(LOGO_PATH, use_container_width=True)
+            st.image(LOGO_PATH, width="stretch")
         st.markdown('<h2 class="login-title">WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
     else:
         st.markdown('<h2 class="login-title">🧠 WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
@@ -198,7 +199,7 @@ def login_page():
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign In", use_container_width=True)
+        submitted = st.form_submit_button("Sign In", width="stretch")
 
     if submitted:
         users = get_user_db()
@@ -215,7 +216,7 @@ def login_page():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# MODEL — loaded automatically from disk, nothing user-facing here.
+# AUTOMATED MODEL & STATS LOADING
 # ─────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_model_cached(_path: str, content_hash: str):
@@ -237,7 +238,6 @@ def load_norm_stats_cached(content_hash: str, raw_bytes: bytes):
 
 
 def load_bundled_norm_stats():
-    """Auto-load norm_stats.npz next to app.py if present; silent otherwise."""
     for name in ["norm_stats.npz"]:
         if os.path.exists(name):
             with open(name, "rb") as f:
@@ -263,6 +263,9 @@ def init_state():
         norm_std=None,
         example_active=False,
         example_stop_at=None,
+        arduino_client=None,
+        arduino_status="Disconnected",
+        last_poll_time=None,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -278,35 +281,94 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────
-# SIDEBAR — just what a lay person needs
+# ARDUINO HELPER
+# ─────────────────────────────────────────────────────────────────────────
+def get_arduino_credentials():
+    cid, csec = "", ""
+    try:
+        if "arduino_cloud" in st.secrets:
+            cid = st.secrets["arduino_cloud"].get("client_id", "")
+            csec = st.secrets["arduino_cloud"].get("client_secret", "")
+    except Exception:
+        pass
+    return cid, csec
+
+# ─────────────────────────────────────────────────────────────────────────
+# SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     if LOGO_PATH:
-        st.image(LOGO_PATH, use_container_width=True)
+        st.image(LOGO_PATH, width="stretch")
         st.markdown(f"### Welcome, {st.session_state.username}")
     else:
         st.markdown(f"### 🧠 Welcome, {st.session_state.username}")
-    if st.button("Log out", use_container_width=True):
+    if st.button("Log out", width="stretch"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
-    st.markdown('<div class="sidebar-section-title">Try a scenario</div>', unsafe_allow_html=True)
-    scenario = st.selectbox("Simulated condition", CONDITION_NAMES)
-    inject_freeze, freeze_at = False, None
-    if scenario == "Parkinson's / FOG risk":
-        inject_freeze = st.checkbox("Include a freeze-of-gait event", value=True)
-        if inject_freeze:
-            freeze_at = st.slider("Freeze occurs at (s)", 10, 60, 25)
+    st.markdown('<div class="sidebar-section-title">Data Source</div>', unsafe_allow_html=True)
+    source = st.radio(
+        "Source Mode",
+        ["Synthetic Demo", "Arduino Cloud (IoT)"],
+        label_visibility="collapsed",
+    )
+
+    scenario, inject_freeze, freeze_at = CONDITION_NAMES[0], False, None
+    ard_client_id, ard_client_secret, ard_thing_id, ard_var_name, ard_poll_s = "", "", "", "emgBatch", 0.5
+
+    if source == "Synthetic Demo":
+        st.markdown('<div class="sidebar-section-title">Try a scenario</div>', unsafe_allow_html=True)
+        scenario = st.selectbox("Simulated condition", CONDITION_NAMES)
+        if scenario == "Parkinson's / FOG risk":
+            inject_freeze = st.checkbox("Include a freeze-of-gait event", value=True)
+            if inject_freeze:
+                freeze_at = st.slider("Freeze occurs at (s)", 10, 60, 25)
+    else:
+        # Arduino IoT Configuration & Status Widget
+        secret_cid, secret_csec = get_arduino_credentials()
+        st.caption("Connect live 8-channel hardware stream via Arduino IoT Cloud.")
+        ard_client_id = st.text_input("Client ID", value=secret_cid)
+        ard_client_secret = st.text_input("Client Secret", value=secret_csec, type="password")
+        ard_thing_id = st.text_input("Thing ID")
+        ard_var_name = st.text_input("Variable Name", value="emgBatch")
+        ard_poll_s = st.slider("Poll Interval (s)", 0.3, 3.0, 0.5, step=0.1)
+
+        st.markdown('<div class="sidebar-section-title">Arduino Status</div>', unsafe_allow_html=True)
+        if st.session_state.arduino_status == "Connected":
+            st.success("🟢 Connected (Wi-Fi Active)")
+        elif st.session_state.arduino_status == "Polling":
+            st.warning("🟡 Polling Data...")
+        else:
+            st.error("🔴 Disconnected")
+
+        if st.session_state.last_poll_time:
+            st.caption(f"Last polled: {st.session_state.last_poll_time}")
+
+        if st.button("⚡ Test Connection", width="stretch"):
+            if not (ard_client_id and ard_client_secret and ard_thing_id):
+                st.error("Fill in Client ID, Secret, and Thing ID!")
+            else:
+                with st.spinner("Connecting to Arduino Cloud..."):
+                    try:
+                        client = ArduinoCloudClient(ard_client_id, ard_client_secret)
+                        client.get_property_value(ard_thing_id, ard_var_name)
+                        st.session_state.arduino_client = client
+                        st.session_state.arduino_status = "Connected"
+                        st.session_state.last_poll_time = time.strftime("%H:%M:%S")
+                        st.success("Board online and communicating!")
+                    except Exception as e:
+                        st.session_state.arduino_status = "Disconnected"
+                        st.error(f"Connection failed: {e}")
 
     st.markdown('<div class="sidebar-section-title">Controls</div>', unsafe_allow_html=True)
     col_a, col_b, col_c = st.columns(3)
-    play_clicked = col_a.button("▶ Play", use_container_width=True)
-    pause_clicked = col_b.button("⏸ Pause", use_container_width=True)
-    stop_clicked = col_c.button("⏹ Stop", use_container_width=True)
+    play_clicked = col_a.button("▶ Play", width="stretch")
+    pause_clicked = col_b.button("⏸ Pause", width="stretch")
+    stop_clicked = col_c.button("⏹ Stop", width="stretch")
 
     example_clicked = st.button(
-        "🧪 Run Example (FOG, 15s)", use_container_width=True,
+        "🧪 Run Example (FOG, 15s)", width="stretch",
         help="A ready-made 15s demo of a Parkinson's/FOG scenario with a freeze event.",
     )
 
@@ -326,9 +388,8 @@ with st.sidebar:
     st.download_button(
         "⬇ Download report", data=report_csv,
         file_name="walkinpeace_report.csv", mime="text/csv",
-        disabled=not has_data, use_container_width=True,
-        help="Download this session's predictions as a CSV report." if has_data
-             else "Play or run the example first to generate a report.",
+        disabled=not has_data, width="stretch",
+        help="Download this session's predictions as a CSV report.",
     )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -337,7 +398,7 @@ with st.sidebar:
 if LOGO_PATH:
     hcol1, hcol2 = st.columns([1, 10])
     with hcol1:
-        st.image(LOGO_PATH, use_container_width=True)
+        st.image(LOGO_PATH, width="stretch")
     with hcol2:
         st.markdown(
             '<div class="app-header"><div><p class="kicker">Real-time neuromuscular monitoring</p>'
@@ -364,6 +425,7 @@ if stop_clicked:
     st.session_state.running = False
     st.session_state.example_active = False
     st.session_state.example_stop_at = None
+    st.session_state.arduino_status = "Disconnected"
 
 if pause_clicked:
     st.session_state.running = False
@@ -376,12 +438,22 @@ if play_clicked:
     st.session_state.example_stop_at = None
     if st.session_state.extractor is None:
         st.session_state.extractor = StreamingFeatureExtractor()
-    if st.session_state.streamer is None:
-        use_freeze = scenario == "Parkinson's / FOG risk" and inject_freeze
-        st.session_state.streamer = SyntheticEMGStreamer(
-            scenario=scenario, seed=42,
-            freeze_at_s=freeze_at if use_freeze else None,
-        )
+    
+    if source == "Synthetic Demo":
+        if st.session_state.streamer is None:
+            use_freeze = scenario == "Parkinson's / FOG risk" and inject_freeze
+            st.session_state.streamer = SyntheticEMGStreamer(
+                scenario=scenario, seed=42,
+                freeze_at_s=freeze_at if use_freeze else None,
+            )
+    else:
+        if not (ard_client_id and ard_client_secret and ard_thing_id):
+            status_placeholder.error("Arduino Cloud needs Client ID, Client Secret, and Thing ID.")
+            st.session_state.running = False
+            st.session_state.arduino_status = "Disconnected"
+        else:
+            st.session_state.arduino_client = ArduinoCloudClient(ard_client_id, ard_client_secret)
+            st.session_state.arduino_status = "Polling"
 
 if example_clicked:
     st.session_state.extractor = StreamingFeatureExtractor()
@@ -396,7 +468,7 @@ if example_clicked:
     st.session_state.example_stop_at = 15.0
 
 # ─────────────────────────────────────────────────────────────────────────
-# LOAD MODEL (silent — nothing shown unless something goes wrong)
+# LOAD MODEL & NORM STATS AUTOMATICALLY
 # ─────────────────────────────────────────────────────────────────────────
 model = None
 model_err = None
@@ -406,9 +478,9 @@ try:
         content_hash = hashlib.md5(default_path.encode()).hexdigest()
         model = load_model_cached(default_path, content_hash)
     else:
-        model_err = "Demo is temporarily unavailable. Please try again shortly."
-except Exception:
-    model_err = "Demo is temporarily unavailable. Please try again shortly."
+        model_err = "Model file non-existent. Place fog_pathology_model.h5 next to app.py."
+except Exception as e:
+    model_err = f"Model loading failed: {e}"
 
 if st.session_state.norm_mean is None:
     nm, ns = load_bundled_norm_stats()
@@ -480,11 +552,10 @@ def render_dashboard():
         xaxis_title="time (s)", yaxis_title="channel (offset)",
         legend=dict(orientation="h", y=-0.2),
         margin=dict(l=40, r=20, t=50, b=40),
-        transition=dict(duration=200, easing="cubic-in-out"),
     )
     with emg_chart_ph.container():
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.plotly_chart(fig_emg, use_container_width=True, key="emg_chart")
+        st.plotly_chart(fig_emg, width="stretch", key="emg_chart")
         st.markdown('</div>', unsafe_allow_html=True)
 
     if log:
@@ -506,11 +577,10 @@ def render_dashboard():
             xaxis_title="time (s)", yaxis_title="probability", yaxis_range=[0, 1],
             legend=dict(orientation="h", y=-0.25),
             margin=dict(l=40, r=20, t=50, b=40),
-            transition=dict(duration=200, easing="cubic-in-out"),
         )
         with pred_chart_ph.container():
             st.markdown('<div class="panel">', unsafe_allow_html=True)
-            st.plotly_chart(fig_pred, use_container_width=True, key="pred_chart")
+            st.plotly_chart(fig_pred, width="stretch", key="pred_chart")
             st.markdown('</div>', unsafe_allow_html=True)
 
         fog_vals = [r["fog_seconds"] for r in log]
@@ -544,14 +614,13 @@ def render_dashboard():
             title="Time-to-freeze trend", height=280, **CHART_TEMPLATE,
             xaxis_title="time (s)", yaxis_title="seconds", yaxis_range=[0, TTF_MAX],
             margin=dict(l=40, r=20, t=50, b=40),
-            transition=dict(duration=200, easing="cubic-in-out"),
         )
 
         with fog_chart_ph.container():
             st.markdown('<div class="panel">', unsafe_allow_html=True)
             gcol, tcol = st.columns([1, 1.4])
-            gcol.plotly_chart(gauge, use_container_width=True, key="fog_gauge")
-            tcol.plotly_chart(fog_trend, use_container_width=True, key="fog_trend")
+            gcol.plotly_chart(gauge, width="stretch", key="fog_gauge")
+            tcol.plotly_chart(fog_trend, width="stretch", key="fog_trend")
             st.markdown('</div>', unsafe_allow_html=True)
 
         with table_ph.container():
@@ -560,28 +629,53 @@ def render_dashboard():
                 "Condition": CONDITION_NAMES[1:],
                 "Probability": [f"{p*100:0.1f}%" for p in log[-1]["path_probs"][1:]],
             })
-            st.dataframe(snap, use_container_width=True, hide_index=True, key="snap_table")
+            st.dataframe(snap, width="stretch", hide_index=True, key="snap_table")
     else:
-        pred_chart_ph.info("Waiting for enough signal (needs 7s of context) before predictions begin...")
-        # Claim these slots on the initial full run too (even with no predictions
-        # yet), otherwise the fragment can't safely write into them later once
-        # `log` becomes non-empty on a fragment-only rerun.
-        fog_chart_ph.empty()
-        table_ph.empty()
+        # Guarantee initial run populates placeholders to prevent StreamlitAPIException
+        with pred_chart_ph.container():
+            st.info("Waiting for enough signal (needs 7s of context) before predictions begin...")
+        
+        with fog_chart_ph.container():
+            st.empty()
+
+        with table_ph.container():
+            st.empty()
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# LIVE TICK — one generate/infer/redraw step, run on a timer via st.fragment.
-# Public build only has the synthetic demo source, so this is intentionally
-# simple: no CSV or Arduino branches to juggle.
+# LIVE TICK — FRAGMENT
 # ─────────────────────────────────────────────────────────────────────────
 def _live_tick():
     if not st.session_state.running or model is None:
         render_dashboard()
         return
 
-    chunk_samples = max(1, int(FS * (DEFAULT_CHUNK_MS / 1000.0) * DEFAULT_SPEED))
-    chunk = st.session_state.streamer.generate_chunk(chunk_samples)
+    chunk = None
+    if source == "Synthetic Demo" or st.session_state.example_active:
+        chunk_samples = max(1, int(FS * (DEFAULT_CHUNK_MS / 1000.0) * DEFAULT_SPEED))
+        chunk = st.session_state.streamer.generate_chunk(chunk_samples)
+    else:  # Arduino Cloud
+        client = st.session_state.arduino_client
+        try:
+            raw_val = client.get_property_value(ard_thing_id, ard_var_name)
+            chunk = decode_emg_batch(raw_val, n_channels=N_CHANNELS)
+            st.session_state.arduino_status = "Connected"
+            st.session_state.last_poll_time = time.strftime("%H:%M:%S")
+
+            if chunk is None:
+                status_placeholder.markdown(
+                    '<span class="badge badge-iot">ARDUINO CLOUD</span>&nbsp;'
+                    '<span class="badge badge-paused">waiting for first batch…</span>',
+                    unsafe_allow_html=True,
+                )
+                render_dashboard()
+                return
+        except ArduinoCloudError as e:
+            status_placeholder.markdown(f'<span class="badge badge-error">{e}</span>', unsafe_allow_html=True)
+            st.session_state.running = False
+            st.session_state.arduino_status = "Disconnected"
+            render_dashboard()
+            return
 
     new_slices = st.session_state.extractor.push_samples(chunk)
     st.session_state.session_t += chunk.shape[1] / FS
@@ -603,7 +697,7 @@ def _live_tick():
             path_probs = np.asarray(preds[0]).flatten()
             fog_seconds = float(np.asarray(preds[1]).flatten()[0]) if len(preds) > 1 else None
         except Exception as e:
-            status_placeholder.error(f"Something went wrong during prediction: {e}")
+            status_placeholder.error(f"Prediction error: {e}")
             st.session_state.running = False
             render_dashboard()
             return
@@ -615,8 +709,13 @@ def _live_tick():
             st.session_state.pred_log = st.session_state.pred_log[-MAX_LOG_LEN:]
 
     render_dashboard()
-    badge = ('<span class="badge badge-demo">EXAMPLE</span>' if st.session_state.example_active
-             else '<span class="badge badge-live">LIVE</span>')
+    if source == "Arduino Cloud (IoT)":
+        badge = '<span class="badge badge-iot">ARDUINO CLOUD</span>'
+    elif st.session_state.example_active:
+        badge = '<span class="badge badge-demo">EXAMPLE</span>'
+    else:
+        badge = '<span class="badge badge-live">LIVE</span>'
+
     status_placeholder.markdown(
         f'{badge}&nbsp;&nbsp;t = {st.session_state.session_t:0.1f}s', unsafe_allow_html=True,
     )
@@ -628,5 +727,6 @@ def _live_tick():
         status_placeholder.info("Example run complete — 15s synthetic FOG demo finished.")
 
 
-tick_interval = max(0.15, DEFAULT_CHUNK_MS / 1000.0 / max(DEFAULT_SPEED, 0.1))
+tick_interval = ard_poll_s if source == "Arduino Cloud (IoT)" else (DEFAULT_CHUNK_MS / 1000.0)
+tick_interval = max(0.3, tick_interval)
 st.fragment(run_every=tick_interval)(_live_tick)()
