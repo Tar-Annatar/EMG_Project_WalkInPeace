@@ -2,8 +2,8 @@
 EMG Pathology & Freeze-of-Gait Monitor — Streamlit App
 =======================================================
 - Simple username/password gate.
-- Live (streamed / simulated) 8-channel EMG view with noise removed
-  (band-pass + 50Hz notch, matching the training pipeline).
+- Three live data sources: synthetic demo, CSV playback, or a live 8-channel
+  feed pulled from an Arduino IoT Cloud "Thing" (see ARDUINO_SKETCH.ino).
 - Runs the trained Keras model (fog_pathology_model.h5) in real time and
   shows pathology-condition probabilities and Parkinson's freeze-risk
   countdown over multiple time ranges.
@@ -11,26 +11,29 @@ EMG Pathology & Freeze-of-Gait Monitor — Streamlit App
 Run locally:
     streamlit run app.py
 
-Deploy: push this folder (app.py, signal_utils.py, requirements.txt,
-fog_pathology_model.h5) to a GitHub repo and deploy on Streamlit
-Community Cloud (share.streamlit.io) or any host that runs Streamlit.
+Deploy: push this folder (app.py, signal_utils.py, arduino_cloud.py,
+requirements.txt, fog_pathology_model.h5) to a GitHub repo and deploy on
+Streamlit Community Cloud (share.streamlit.io) or any host that runs
+Streamlit.
 """
 
 import os
 import time
 import hashlib
-from collections import deque
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from signal_utils import (
     FS, N_CHANNELS, STRIDE, WINDOW_SLICES, TTF_MAX, CONDITION_NAMES,
     StreamingFeatureExtractor, RunningNormalizer, SyntheticEMGStreamer,
 )
+from arduino_cloud import ArduinoCloudClient, ArduinoCloudError, decode_emg_batch
+
+MAX_LOG_LEN = 20000  # cap prediction history so "Full session" can't grow unbounded
 
 # ─────────────────────────────────────────────────────────────────────────
 # LOGO
@@ -44,32 +47,52 @@ def find_logo_path():
 LOGO_PATH = find_logo_path()
 
 # ─────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG + GREEN THEME
+# PAGE CONFIG + THEME
 # ─────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="WalkInPeace EMG Monitor",
-    page_icon=LOGO_PATH or "🟢",
+    page_title="NeuroGait EMG Monitor",
+    page_icon=LOGO_PATH or "🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-GREEN_CSS = """
+THEME_CSS = """
 <style>
 :root {
-    --g-dark:   #0b3d2e;
-    --g-mid:    #1b5e3a;
-    --g-main:   #2e7d32;
-    --g-accent: #52b788;
-    --g-light:  #b7e4c7;
-    --g-bg:     #f1faf3;
+    --bg:        #f4f6fb;
+    --surface:   #ffffff;
+    --border:    #e4e8f1;
+    --ink:       #0f172a;
+    --ink-soft:  #56607a;
+    --accent:    #4f46e5;
+    --accent-2:  #14b8a6;
+    --accent-soft: #eef0fe;
+    --success:   #10b981;
+    --warning:   #f59e0b;
+    --danger:    #ef4444;
+    --sidebar-1: #0b1120;
+    --sidebar-2: #172038;
 }
-html, body, [class*="css"]  { font-family: 'Segoe UI', sans-serif; }
-.stApp { background-color: var(--g-bg); }
+html, body, [class*="css"] {
+    font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.stApp { background: var(--bg); }
+h1, h2, h3, h4 { color: var(--ink) !important; letter-spacing: -0.01em; }
+p, span, label, div { color: var(--ink); }
+
+/* App header */
+.app-header { display:flex; align-items:center; gap:14px; padding: 4px 0 18px 0; }
+.app-header .kicker {
+    color: var(--accent); font-weight:700; font-size:0.78em;
+    letter-spacing:0.08em; text-transform:uppercase; margin:0;
+}
+.app-header h1 { margin:0; font-size:1.7em; }
+
+/* Sidebar */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, var(--g-dark) 0%, var(--g-mid) 100%);
+    background: linear-gradient(180deg, var(--sidebar-1) 0%, var(--sidebar-2) 100%);
+    border-right: 1px solid rgba(255,255,255,0.06);
 }
-section[data-testid="stSidebar"] { color: #eafaf0; }
-/* Text sitting directly on the dark sidebar gradient: keep it light */
 section[data-testid="stSidebar"] p,
 section[data-testid="stSidebar"] span,
 section[data-testid="stSidebar"] label,
@@ -80,62 +103,71 @@ section[data-testid="stSidebar"] h4,
 section[data-testid="stSidebar"] .stMarkdown,
 section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
 section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
-    color: #eafaf0 !important;
+    color: #e7eaf6 !important;
 }
-/* Native Streamlit controls keep their own light surface (white/light-gray
-   box) — force dark text on THOSE instead of inheriting the light color
-   above, or the value becomes invisible (near-white text on a light box). */
 section[data-testid="stSidebar"] input,
 section[data-testid="stSidebar"] textarea,
 section[data-testid="stSidebar"] [data-baseweb="select"] *,
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] * {
-    color: var(--g-dark) !important;
+    color: var(--ink) !important;
 }
-section[data-testid="stSidebar"] input::placeholder {
-    color: #4b6f5f !important;
-    opacity: 1;
+section[data-testid="stSidebar"] input::placeholder { color: #7c8aa5 !important; opacity:1; }
+section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.08); }
+.sidebar-section-title {
+    font-size:0.72em; font-weight:700; letter-spacing:0.09em; text-transform:uppercase;
+    color:#8b96b8 !important; margin: 14px 0 4px 0;
 }
-h1, h2, h3 { color: var(--g-dark) !important; }
+
+/* Buttons */
 div.stButton > button, div.stDownloadButton > button {
-    background-color: var(--g-main);
-    color: white;
-    border-radius: 8px;
-    border: none;
-    padding: 0.5em 1.2em;
-    font-weight: 600;
+    background: var(--accent); color:white; border:none; border-radius:9px;
+    padding:0.5em 1.1em; font-weight:600; transition: all 0.15s ease;
+    box-shadow: 0 1px 2px rgba(79,70,229,0.25);
 }
-div.stButton > button:hover { background-color: var(--g-dark); color: white; }
+div.stButton > button:hover { background:#4338ca; transform: translateY(-1px); }
+div.stButton > button:active { transform: translateY(0); }
+
+/* Metric cards */
 [data-testid="stMetric"] {
-    background-color: white;
-    border: 1px solid var(--g-light);
-    border-radius: 10px;
-    padding: 10px 14px;
-    box-shadow: 0 1px 4px rgba(11,61,46,0.08);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 18px; box-shadow: 0 1px 3px rgba(15,23,42,0.04);
 }
-[data-testid="stMetricLabel"] { color: var(--g-mid) !important; }
+[data-testid="stMetricLabel"] { color: var(--ink-soft) !important; font-weight:600; }
+[data-testid="stMetricValue"] { color: var(--ink) !important; }
+
+/* Login card */
 .login-box {
-    max-width: 420px;
-    margin: 8vh auto 0 auto;
-    background: white;
-    padding: 2.5em 2.5em 2em 2.5em;
-    border-radius: 16px;
-    box-shadow: 0 6px 24px rgba(11,61,46,0.15);
-    border-top: 6px solid var(--g-main);
+    max-width: 430px; margin: 8vh auto 0 auto; background: var(--surface);
+    padding: 2.6em 2.6em 2em 2.6em; border-radius: 18px;
+    box-shadow: 0 20px 60px rgba(15,23,42,0.12);
+    border-top: 5px solid var(--accent);
 }
-.login-title { text-align:center; color: var(--g-dark); margin-bottom:0.2em;}
-.login-sub { text-align:center; color: var(--g-mid); margin-bottom:1.5em; font-size:0.9em;}
-.badge-live {
-    display:inline-block; background:var(--g-accent); color:white;
-    padding:3px 10px; border-radius:12px; font-size:0.8em; font-weight:600;
+.login-title { text-align:center; color: var(--ink); margin-bottom:0.15em; }
+.login-sub { text-align:center; color: var(--ink-soft); margin-bottom:1.6em; font-size:0.92em; }
+
+/* Status badges */
+.badge { display:inline-block; padding:4px 12px; border-radius:20px; font-size:0.78em; font-weight:700; letter-spacing:0.02em; }
+.badge-live   { background:#dcfce7; color:#15803d; }
+.badge-paused { background:#f1f5f9; color:#475569; }
+.badge-demo   { background:#fef3c7; color:#92400e; }
+.badge-error  { background:#fee2e2; color:#b91c1c; }
+.badge-iot    { background:#e0e7ff; color:#3730a3; }
+
+/* Panel container around charts */
+.panel {
+    background: var(--surface); border:1px solid var(--border);
+    border-radius:16px; padding: 6px 6px 2px 6px; margin-bottom:16px;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.04);
 }
 </style>
 """
-st.markdown(GREEN_CSS, unsafe_allow_html=True)
+st.markdown(THEME_CSS, unsafe_allow_html=True)
 
-PLOTLY_GREENS = ["#1b5e3a", "#2e7d32", "#40916c", "#52b788", "#74c69d",
-                  "#95d5b2", "#b7e4c7", "#d8f3dc"]
+PLOTLY_COLORS = ["#4f46e5", "#14b8a6", "#f59e0b", "#ef4444",
+                  "#0ea5e9", "#8b5cf6", "#22c55e", "#ec4899"]
+CHART_TEMPLATE = dict(plot_bgcolor="#fbfbfe", paper_bgcolor="white")
 
 # ─────────────────────────────────────────────────────────────────────────
 # AUTH
@@ -143,11 +175,9 @@ PLOTLY_GREENS = ["#1b5e3a", "#2e7d32", "#40916c", "#52b788", "#74c69d",
 def _hash(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# Default demo credentials. For real deployments, replace this dict with
-# values pulled from st.secrets["credentials"] instead of hardcoding.
 DEFAULT_USERS = {
     "demo": _hash("emg2026"),
-    "clinician": _hash("WalkInPeace"),
+    "clinician": _hash("neurogait"),
 }
 
 def get_user_db():
@@ -155,7 +185,7 @@ def get_user_db():
         if "credentials" in st.secrets:
             return {u: _hash(p) for u, p in st.secrets["credentials"].items()}
     except Exception:
-        pass  # no secrets.toml configured -> fall back to demo credentials
+        pass
     return DEFAULT_USERS
 
 
@@ -165,9 +195,9 @@ def login_page():
         lcol1, lcol2, lcol3 = st.columns([1, 1, 1])
         with lcol2:
             st.image(LOGO_PATH, use_container_width=True)
-        st.markdown('<h2 class="login-title">WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
     else:
-        st.markdown('<h2 class="login-title">🟢 WalkInPeace EMG Monitor</h2>', unsafe_allow_html=True)
+        st.markdown('<h2 class="login-title">🧠 NeuroGait EMG Monitor</h2>', unsafe_allow_html=True)
     st.markdown('<div class="login-sub">Sign in to access the live EMG dashboard</div>', unsafe_allow_html=True)
 
     with st.form("login_form"):
@@ -190,12 +220,14 @@ def login_page():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# MODEL LOADING
+# MODEL LOADING — cache keyed on content hash, not path, so re-uploading a
+# different file actually invalidates the cache (the old version cached by
+# tmp filename, which never changed between uploads — a real bug, fixed here).
 # ─────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model...")
-def load_model(model_bytes_or_path):
+def load_model_cached(_path: str, content_hash: str):
     import tensorflow as tf
-    return tf.keras.models.load_model(model_bytes_or_path, compile=False)
+    return tf.keras.models.load_model(_path, compile=False)
 
 
 def find_default_model_path():
@@ -205,12 +237,15 @@ def find_default_model_path():
     return None
 
 
-@st.cache_resource(show_spinner=False)
-def load_norm_stats(path):
-    if path and os.path.exists(path):
-        data = np.load(path)
-        return data["mean"], data["std"]
-    return None, None
+@st.cache_data(show_spinner=False)
+def load_norm_stats_cached(content_hash: str, raw_bytes: bytes):
+    data = np.load(BytesIO(raw_bytes))
+    return data["mean"], data["std"]
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_cached(content_hash: str, raw_bytes: bytes):
+    return pd.read_csv(BytesIO(raw_bytes))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -222,7 +257,7 @@ def init_state():
         username=None,
         extractor=None,
         normalizer=None,
-        pred_log=[],  # list of dicts: t, path_probs(7,), fog_seconds
+        pred_log=[],
         session_t=0.0,
         running=False,
         streamer=None,
@@ -230,6 +265,9 @@ def init_state():
         norm_std=None,
         example_active=False,
         example_stop_at=None,
+        csv_cursor=0,
+        arduino_client=None,
+        arduino_error=None,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -247,19 +285,29 @@ if not st.session_state.authenticated:
 # ─────────────────────────────────────────────────────────────────────────
 # SIDEBAR — DATA SOURCE + MODEL + CONTROLS
 # ─────────────────────────────────────────────────────────────────────────
+def get_arduino_credentials():
+    """Prefer st.secrets (for deployed apps); sidebar fields override/fill gaps."""
+    cid, csec = "", ""
+    try:
+        if "arduino_cloud" in st.secrets:
+            cid = st.secrets["arduino_cloud"].get("client_id", "")
+            csec = st.secrets["arduino_cloud"].get("client_secret", "")
+    except Exception:
+        pass
+    return cid, csec
+
 with st.sidebar:
     if LOGO_PATH:
         st.image(LOGO_PATH, use_container_width=True)
         st.markdown(f"### Welcome, {st.session_state.username}")
     else:
-        st.markdown(f"### 🟢 Welcome, {st.session_state.username}")
-    if st.button("Log out"):
+        st.markdown(f"### 🧠 Welcome, {st.session_state.username}")
+    if st.button("Log out", use_container_width=True):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
-    st.markdown("---")
-    st.markdown("#### Model")
+    st.markdown('<div class="sidebar-section-title">Model</div>', unsafe_allow_html=True)
     default_path = find_default_model_path()
     model_file = st.file_uploader("Upload .h5 model (optional)", type=["h5"])
     model_path_text = st.text_input(
@@ -268,14 +316,19 @@ with st.sidebar:
     )
     norm_file = st.file_uploader("Normalization stats (.npz, optional)", type=["npz"])
 
-    st.markdown("---")
-    st.markdown("#### Data source")
-    source = st.radio("Choose EMG input", ["Live Demo (synthetic)", "Upload CSV recording"])
+    st.markdown('<div class="sidebar-section-title">Data source</div>', unsafe_allow_html=True)
+    source = st.radio(
+        "Choose EMG input",
+        ["Live Demo (synthetic)", "Upload CSV recording", "Arduino Cloud (IoT)"],
+        label_visibility="collapsed",
+    )
 
-    # Always define these so later code (outside the sidebar) never hits a
-    # NameError regardless of which branch was chosen.
+    # Always defined so later code never hits a NameError.
     scenario, inject_freeze, freeze_at, seed = CONDITION_NAMES[0], False, None, 42
     uploaded_csv, csv_fs = None, FS
+    ard_client_id, ard_client_secret, ard_thing_id, ard_var_name, ard_poll_s = (
+        "", "", "", "emgBatch", 0.5
+    )
 
     if source == "Live Demo (synthetic)":
         scenario = st.selectbox("Simulated condition", CONDITION_NAMES)
@@ -284,16 +337,41 @@ with st.sidebar:
             if inject_freeze:
                 freeze_at = st.slider("Freeze occurs at (s)", 10, 60, 25)
         seed = st.number_input("Random seed", value=42, step=1)
-    else:
+
+    elif source == "Upload CSV recording":
         uploaded_csv = st.file_uploader("EMG CSV (>=8 numeric channel columns)", type=["csv"])
-        st.caption("First 8 numeric columns are used as channels 1-8, assumed sampled at "
-                   f"{FS} Hz unless a 'fs' is specified below.")
+        st.caption(f"First 8 numeric columns are used as channels 1-8. If the CSV wasn't "
+                   f"recorded at {FS} Hz, set its real rate below and it'll be resampled.")
         csv_fs = st.number_input("Sample rate of CSV (Hz)", value=FS, step=50)
 
-    st.markdown("---")
-    st.markdown("#### Playback")
-    speed = st.slider("Playback speed multiplier", 0.5, 10.0, 3.0, step=0.5)
-    chunk_ms = st.slider("Update interval (ms)", 50, 500, 150, step=50)
+    else:  # Arduino Cloud (IoT)
+        secret_cid, secret_csec = get_arduino_credentials()
+        st.caption("Reads live 8-channel batches pushed by your Arduino board via "
+                   "Arduino IoT Cloud. See the setup guide below the dashboard.")
+        ard_client_id = st.text_input(
+            "Client ID", value=secret_cid,
+            help="From Arduino Cloud → API Keys. Leave blank if set in st.secrets.",
+        )
+        ard_client_secret = st.text_input(
+            "Client Secret", value=secret_csec, type="password",
+            help="Shown once when the API key is created — store it in st.secrets for deployed apps.",
+        )
+        ard_thing_id = st.text_input("Thing ID", help="Found on the Thing's page in Arduino Cloud.")
+        ard_var_name = st.text_input(
+            "Batch variable name", value="emgBatch",
+            help="The String Cloud Variable your sketch writes JSON batches into.",
+        )
+        ard_poll_s = st.slider(
+            "Poll interval (s)", 0.2, 5.0, 0.5, step=0.1,
+            help="How often to pull the latest batch from Arduino Cloud's REST API. "
+                 "Keep this ≥0.2s to stay comfortably within API rate limits.",
+        )
+
+    st.markdown('<div class="sidebar-section-title">Playback</div>', unsafe_allow_html=True)
+    speed = st.slider("Playback speed multiplier", 0.5, 10.0, 3.0, step=0.5,
+                       disabled=(source == "Arduino Cloud (IoT)"))
+    chunk_ms = st.slider("Update interval (ms)", 50, 500, 150, step=50,
+                          disabled=(source == "Arduino Cloud (IoT)"))
 
     col_a, col_b = st.columns(2)
     start_clicked = col_a.button("▶ Start", use_container_width=True)
@@ -314,9 +392,17 @@ if LOGO_PATH:
     with hcol1:
         st.image(LOGO_PATH, use_container_width=True)
     with hcol2:
-        st.title("WalkInPeace — Live EMG Pathology & Freeze-of-Gait Monitor")
+        st.markdown(
+            '<div class="app-header"><div><p class="kicker">Real-time neuromuscular monitoring</p>'
+            '<h1>NeuroGait — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
+            unsafe_allow_html=True,
+        )
 else:
-    st.title("🟢 WalkInPeace — Live EMG Pathology & Freeze-of-Gait Monitor")
+    st.markdown(
+        '<div class="app-header"><div><p class="kicker">Real-time neuromuscular monitoring</p>'
+        '<h1>🧠 NeuroGait — EMG Pathology &amp; Freeze-of-Gait Monitor</h1></div></div>',
+        unsafe_allow_html=True,
+    )
 status_placeholder = st.empty()
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -331,6 +417,7 @@ if reset_clicked:
     st.session_state.running = False
     st.session_state.example_active = False
     st.session_state.example_stop_at = None
+    st.session_state.csv_cursor = 0
 
 if start_clicked:
     st.session_state.running = True
@@ -344,6 +431,13 @@ if start_clicked:
             scenario=scenario, seed=int(seed),
             freeze_at_s=freeze_at if use_freeze else None,
         )
+    elif source == "Arduino Cloud (IoT)":
+        st.session_state.streamer = None
+        if not (ard_client_id and ard_client_secret and ard_thing_id):
+            status_placeholder.error("Arduino Cloud needs Client ID, Client Secret, and Thing ID.")
+            st.session_state.running = False
+        else:
+            st.session_state.arduino_client = ArduinoCloudClient(ard_client_id, ard_client_secret)
     else:
         st.session_state.streamer = None  # CSV handled separately below
 
@@ -353,10 +447,6 @@ if stop_clicked:
     st.session_state.example_stop_at = None
 
 if example_clicked:
-    # Self-contained 15s synthetic run: Parkinson's/FOG scenario with a
-    # freeze event, fully synthetic with light noise — same generator as
-    # "Live Demo", just pre-configured and time-boxed regardless of
-    # whatever the sidebar's data-source radio is currently set to.
     st.session_state.extractor = StreamingFeatureExtractor()
     st.session_state.normalizer = None
     st.session_state.pred_log = []
@@ -375,12 +465,16 @@ model = None
 model_err = None
 try:
     if model_file is not None:
-        tmp_path = "/tmp/_uploaded_model.h5"
-        with open(tmp_path, "wb") as f:
-            f.write(model_file.getbuffer())
-        model = load_model(tmp_path)
+        raw = model_file.getbuffer()
+        content_hash = hashlib.md5(raw).hexdigest()
+        tmp_path = f"/tmp/_uploaded_model_{content_hash}.h5"
+        if not os.path.exists(tmp_path):
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+        model = load_model_cached(tmp_path, content_hash)
     elif model_path_text and os.path.exists(model_path_text):
-        model = load_model(model_path_text)
+        content_hash = hashlib.md5(model_path_text.encode()).hexdigest()
+        model = load_model_cached(model_path_text, content_hash)
     else:
         model_err = ("No model found yet. Upload a `.h5` file in the sidebar, or place "
                       "`fog_pathology_model.h5` next to app.py.")
@@ -388,18 +482,20 @@ except Exception as e:
     model_err = f"Could not load model: {e}"
 
 if norm_file is not None:
-    tmp_norm = "/tmp/_uploaded_norm.npz"
-    with open(tmp_norm, "wb") as f:
-        f.write(norm_file.getbuffer())
-    nm, ns = load_norm_stats(tmp_norm)
+    raw_norm = bytes(norm_file.getbuffer())
+    norm_hash = hashlib.md5(raw_norm).hexdigest()
+    nm, ns = load_norm_stats_cached(norm_hash, raw_norm)
     st.session_state.norm_mean, st.session_state.norm_std = nm, ns
 
 if model_err:
     status_placeholder.warning(model_err)
 else:
+    run_badge = (
+        '<span class="badge badge-live">LIVE</span>' if st.session_state.running
+        else '<span class="badge badge-paused">PAUSED</span>'
+    )
     status_placeholder.markdown(
-        f'<span class="badge-live">MODEL READY</span> &nbsp; '
-        f'{"🟢 LIVE" if st.session_state.running else "⏸ Paused"}',
+        f'<span class="badge badge-demo">MODEL READY</span>&nbsp;{run_badge}',
         unsafe_allow_html=True,
     )
 
@@ -421,27 +517,16 @@ def range_seconds(label):
     return {"Last 5s": 5, "Last 15s": 15, "Last 30s": 30, "Full session": None}[label]
 
 
-if "_render_seq" not in st.session_state:
-    st.session_state._render_seq = 0
-
-
 def render_dashboard():
-    # Within a single "Start" click, the live loop redraws these placeholders
-    # many times in the SAME script run (not via rerun), so every widget
-    # needs a unique key per redraw or Streamlit raises a duplicate-ID error.
-    st.session_state._render_seq += 1
-    seq = st.session_state._render_seq
-
     ext = st.session_state.extractor
     log = st.session_state.pred_log
     win_s = range_seconds(st.session_state.range_choice)
 
-    # ── Metrics row ──
     with metrics_row.container():
         c1, c2, c3, c4 = st.columns(4)
         if log:
             last = log[-1]
-            top_idx = int(np.argmax(last["path_probs"][1:])) + 1  # skip healthy slot
+            top_idx = int(np.argmax(last["path_probs"][1:])) + 1
             top_name = CONDITION_NAMES[top_idx]
             top_conf = last["path_probs"][top_idx]
             healthy_score = max(0.0, 1.0 - float(np.max(last["path_probs"][1:])))
@@ -454,7 +539,6 @@ def render_dashboard():
         c3.metric("Healthy-pattern score", f"{healthy_score*100:0.0f}%")
         c4.metric("Est. time-to-freeze", f"{fog_s:0.1f} s" if fog_s is not None else "n/a")
 
-    # ── Raw/filtered EMG plot ──
     tail_n = FS * (win_s if win_s else 30)
     sig = ext.get_filtered_tail(tail_n) if ext else np.zeros((N_CHANNELS, 0))
     fig_emg = go.Figure()
@@ -462,20 +546,21 @@ def render_dashboard():
         tvec = (np.arange(sig.shape[1]) - sig.shape[1]) / FS + st.session_state.session_t
         for ch in range(N_CHANNELS):
             fig_emg.add_trace(go.Scatter(
-                x=tvec, y=sig[ch] + ch * 3,  # vertical offset per channel
-                mode="lines", name=f"Ch {ch+1}",
-                line=dict(width=1.2, color=PLOTLY_GREENS[ch % len(PLOTLY_GREENS)]),
+                x=tvec, y=sig[ch] + ch * 3, mode="lines", name=f"Ch {ch+1}",
+                line=dict(width=1.2, color=PLOTLY_COLORS[ch % len(PLOTLY_COLORS)]),
             ))
     fig_emg.update_layout(
         title="Live EMG — noise removed (10-200Hz band-pass + 50Hz notch)",
-        height=380, plot_bgcolor="#f6fbf8", paper_bgcolor="white",
+        height=380, **CHART_TEMPLATE,
         xaxis_title="time (s)", yaxis_title="channel (offset)",
         legend=dict(orientation="h", y=-0.2),
         margin=dict(l=40, r=20, t=50, b=40),
     )
-    emg_chart_ph.plotly_chart(fig_emg, use_container_width=True, key=f"emg_chart_{seq}")
+    with emg_chart_ph.container():
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.plotly_chart(fig_emg, use_container_width=True, key="emg_chart")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Prediction-over-time chart ──
     if log:
         df = pd.DataFrame({
             "t": [r["t"] for r in log],
@@ -487,18 +572,20 @@ def render_dashboard():
         for i, cname in enumerate(CONDITION_NAMES[1:]):
             fig_pred.add_trace(go.Scatter(
                 x=df["t"], y=df[cname], mode="lines", name=cname,
-                line=dict(width=2, color=PLOTLY_GREENS[i % len(PLOTLY_GREENS)]),
+                line=dict(width=2, color=PLOTLY_COLORS[i % len(PLOTLY_COLORS)]),
             ))
         fig_pred.update_layout(
             title=f"Pathology-condition probability over time ({st.session_state.range_choice})",
-            height=340, plot_bgcolor="#f6fbf8", paper_bgcolor="white",
+            height=340, **CHART_TEMPLATE,
             xaxis_title="time (s)", yaxis_title="probability", yaxis_range=[0, 1],
             legend=dict(orientation="h", y=-0.25),
             margin=dict(l=40, r=20, t=50, b=40),
         )
-        pred_chart_ph.plotly_chart(fig_pred, use_container_width=True, key=f"pred_chart_{seq}")
+        with pred_chart_ph.container():
+            st.markdown('<div class="panel">', unsafe_allow_html=True)
+            st.plotly_chart(fig_pred, use_container_width=True, key="pred_chart")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── FOG time-to-freeze gauge + trend ──
         fog_vals = [r["fog_seconds"] for r in log]
         latest_fog = fog_vals[-1]
         gauge = go.Figure(go.Indicator(
@@ -507,11 +594,11 @@ def render_dashboard():
             title={"text": "Estimated time-to-freeze (s)"},
             gauge={
                 "axis": {"range": [0, TTF_MAX]},
-                "bar": {"color": "#1b5e3a"},
+                "bar": {"color": "#4f46e5"},
                 "steps": [
-                    {"range": [0, 3], "color": "#d9534f"},
-                    {"range": [3, 6], "color": "#f0ad4e"},
-                    {"range": [6, TTF_MAX], "color": "#b7e4c7"},
+                    {"range": [0, 3], "color": "#fecaca"},
+                    {"range": [3, 6], "color": "#fde68a"},
+                    {"range": [6, TTF_MAX], "color": "#bbf7d0"},
                 ],
             },
         ))
@@ -523,20 +610,21 @@ def render_dashboard():
         fog_trend = go.Figure()
         fog_trend.add_trace(go.Scatter(
             x=fog_df["t"], y=fog_df["ttf"], mode="lines",
-            line=dict(width=2, color="#2e7d32"), fill="tozeroy",
-            fillcolor="rgba(82,183,136,0.25)",
+            line=dict(width=2, color="#4f46e5"), fill="tozeroy",
+            fillcolor="rgba(79,70,229,0.12)",
         ))
         fog_trend.update_layout(
-            title="Time-to-freeze trend", height=280,
-            plot_bgcolor="#f6fbf8", paper_bgcolor="white",
+            title="Time-to-freeze trend", height=280, **CHART_TEMPLATE,
             xaxis_title="time (s)", yaxis_title="seconds", yaxis_range=[0, TTF_MAX],
             margin=dict(l=40, r=20, t=50, b=40),
         )
 
         with fog_chart_ph.container():
+            st.markdown('<div class="panel">', unsafe_allow_html=True)
             gcol, tcol = st.columns([1, 1.4])
-            gcol.plotly_chart(gauge, use_container_width=True, key=f"fog_gauge_{seq}")
-            tcol.plotly_chart(fog_trend, use_container_width=True, key=f"fog_trend_{seq}")
+            gcol.plotly_chart(gauge, use_container_width=True, key="fog_gauge")
+            tcol.plotly_chart(fog_trend, use_container_width=True, key="fog_trend")
+            st.markdown('</div>', unsafe_allow_html=True)
 
         with table_ph.container():
             st.markdown("##### Latest prediction snapshot")
@@ -544,109 +632,172 @@ def render_dashboard():
                 "Condition": CONDITION_NAMES[1:],
                 "Probability": [f"{p*100:0.1f}%" for p in log[-1]["path_probs"][1:]],
             })
-            st.dataframe(snap, use_container_width=True, hide_index=True, key=f"snap_table_{seq}")
+            st.dataframe(snap, use_container_width=True, hide_index=True, key="snap_table")
     else:
         pred_chart_ph.info("Waiting for enough signal (needs 7s of context) before predictions begin...")
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# CSV PLAYBACK SETUP (non-live source)
+# CSV PLAYBACK SETUP (resampled to FS if the CSV's real rate differs — the
+# old version accepted a csv_fs input but silently ignored it, a real bug)
 # ─────────────────────────────────────────────────────────────────────────
 csv_data = None
 if source == "Upload CSV recording" and uploaded_csv is not None:
-    raw_df = pd.read_csv(uploaded_csv)
+    raw_bytes = bytes(uploaded_csv.getbuffer())
+    csv_hash = hashlib.md5(raw_bytes).hexdigest()
+    raw_df = load_csv_cached(csv_hash, raw_bytes)
     numeric_cols = raw_df.select_dtypes(include=[np.number]).columns.tolist()
     if len(numeric_cols) >= N_CHANNELS:
         csv_data = raw_df[numeric_cols[:N_CHANNELS]].to_numpy().T  # (8, N)
+        if csv_fs and int(csv_fs) != FS:
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(int(FS), int(csv_fs))
+            csv_data = resample_poly(csv_data, int(FS) // g, int(csv_fs) // g, axis=1)
+            st.caption(f"Resampled from {int(csv_fs)} Hz to {FS} Hz.")
         st.caption(f"Loaded {csv_data.shape[1]} samples across {N_CHANNELS} channels "
-                   f"({csv_data.shape[1]/csv_fs:0.1f}s at {csv_fs} Hz).")
+                   f"(~{csv_data.shape[1]/FS:0.1f}s at {FS} Hz).")
     else:
         st.error(f"CSV needs at least {N_CHANNELS} numeric columns; found {len(numeric_cols)}.")
 
-if "csv_cursor" not in st.session_state:
-    st.session_state.csv_cursor = 0
-
 # ─────────────────────────────────────────────────────────────────────────
-# MAIN LIVE LOOP
-# One click of "Start" runs a bounded loop that keeps updating the same
-# placeholders in-place (classic lightweight Streamlit live-dashboard
-# pattern). Click "Stop" or let it exhaust the CSV to end the loop.
+# LIVE TICK — one polling/inference/redraw step, run on a timer via
+# st.fragment. This replaces the old blocking while-loop + time.sleep +
+# st.rerun pattern: it's non-blocking, Stop takes effect immediately, and
+# only this fragment's slice of the page re-renders each tick.
 # ─────────────────────────────────────────────────────────────────────────
-if model is not None and st.session_state.running:
-    chunk_samples = max(1, int(FS * (chunk_ms / 1000.0) * speed))
-    loop_iters = 0
-    max_iters = 100000  # safety cap
-
-    while st.session_state.running and loop_iters < max_iters:
-        loop_iters += 1
-
-        # 1) get next raw chunk
-        if st.session_state.example_active or source == "Live Demo (synthetic)":
-            chunk = st.session_state.streamer.generate_chunk(chunk_samples)
-        else:
-            if csv_data is None:
-                status_placeholder.error("Upload a CSV recording to begin, or switch to Live Demo.")
-                st.session_state.running = False
-                break
-            cur = st.session_state.csv_cursor
-            end = cur + chunk_samples
-            if cur >= csv_data.shape[1]:
-                status_placeholder.info("End of recording reached.")
-                st.session_state.running = False
-                break
-            chunk = csv_data[:, cur:end]
-            st.session_state.csv_cursor = end
-
-        # 2) stream through feature extractor
-        new_slices = st.session_state.extractor.push_samples(chunk)
-        st.session_state.session_t += chunk.shape[1] / FS
-
-        # 3) run inference whenever we have a full 7s context and a new slice arrived
-        if new_slices and st.session_state.extractor.ready_for_inference():
-            ctx = st.session_state.extractor.get_context_window()
-
-            if st.session_state.norm_mean is not None:
-                ctx_n = (ctx - st.session_state.norm_mean) / st.session_state.norm_std
-            else:
-                if st.session_state.normalizer is None:
-                    st.session_state.normalizer = RunningNormalizer(ctx.shape[1])
-                for row in ctx:
-                    st.session_state.normalizer.update(row)
-                ctx_n = st.session_state.normalizer.normalize(ctx)
-
-            try:
-                preds = model.predict(ctx_n[np.newaxis, ...], verbose=0)
-                path_probs = np.asarray(preds[0]).flatten()
-                fog_seconds = float(np.asarray(preds[1]).flatten()[0]) if len(preds) > 1 else None
-            except Exception as e:
-                status_placeholder.error(f"Inference error: {e}")
-                st.session_state.running = False
-                break
-
-            st.session_state.pred_log.append(dict(
-                t=st.session_state.session_t,
-                path_probs=path_probs,
-                fog_seconds=fog_seconds,
-            ))
-
-        # 4) redraw
+def _live_tick():
+    if not st.session_state.running or model is None:
         render_dashboard()
-        badge_label = "🧪 EXAMPLE" if st.session_state.example_active else "🟢 LIVE"
-        status_placeholder.markdown(
-            f'<span class="badge-live">{badge_label}</span> &nbsp; t = {st.session_state.session_t:0.1f}s',
-            unsafe_allow_html=True,
-        )
+        return
 
-        # Example runs are time-boxed to 15s — stop after the final frame draws.
-        if (st.session_state.example_active and st.session_state.example_stop_at is not None
-                and st.session_state.session_t >= st.session_state.example_stop_at):
+    chunk = None
+    if st.session_state.example_active or source == "Live Demo (synthetic)":
+        chunk_samples = max(1, int(FS * (chunk_ms / 1000.0) * speed))
+        chunk = st.session_state.streamer.generate_chunk(chunk_samples)
+
+    elif source == "Arduino Cloud (IoT)":
+        client = st.session_state.arduino_client
+        try:
+            raw_val = client.get_property_value(ard_thing_id, ard_var_name)
+            chunk = decode_emg_batch(raw_val, n_channels=N_CHANNELS)
+            if chunk is None:
+                status_placeholder.markdown(
+                    '<span class="badge badge-iot">ARDUINO CLOUD</span>&nbsp;'
+                    '<span class="badge badge-paused">waiting for first batch…</span>',
+                    unsafe_allow_html=True,
+                )
+                render_dashboard()
+                return
+        except ArduinoCloudError as e:
+            status_placeholder.markdown(f'<span class="badge badge-error">{e}</span>', unsafe_allow_html=True)
             st.session_state.running = False
-            st.session_state.example_active = False
-            status_placeholder.info("Example run complete — 15s synthetic FOG demo finished.")
-            break
+            render_dashboard()
+            return
 
-        time.sleep(chunk_ms / 1000.0 / max(speed, 0.1))
+    else:  # CSV
+        if csv_data is None:
+            status_placeholder.error("Upload a CSV recording to begin, or switch to Live Demo.")
+            st.session_state.running = False
+            render_dashboard()
+            return
+        chunk_samples = max(1, int(FS * (chunk_ms / 1000.0) * speed))
+        cur = st.session_state.csv_cursor
+        end = cur + chunk_samples
+        if cur >= csv_data.shape[1]:
+            status_placeholder.info("End of recording reached.")
+            st.session_state.running = False
+            render_dashboard()
+            return
+        chunk = csv_data[:, cur:end]
+        st.session_state.csv_cursor = end
 
-    st.rerun()
-else:
+    new_slices = st.session_state.extractor.push_samples(chunk)
+    st.session_state.session_t += chunk.shape[1] / FS
+
+    if new_slices and st.session_state.extractor.ready_for_inference():
+        ctx = st.session_state.extractor.get_context_window()
+
+        if st.session_state.norm_mean is not None:
+            ctx_n = (ctx - st.session_state.norm_mean) / st.session_state.norm_std
+        else:
+            if st.session_state.normalizer is None:
+                st.session_state.normalizer = RunningNormalizer(ctx.shape[1])
+            for row in ctx:
+                st.session_state.normalizer.update(row)
+            ctx_n = st.session_state.normalizer.normalize(ctx)
+
+        try:
+            preds = model.predict(ctx_n[np.newaxis, ...], verbose=0)
+            path_probs = np.asarray(preds[0]).flatten()
+            fog_seconds = float(np.asarray(preds[1]).flatten()[0]) if len(preds) > 1 else None
+        except Exception as e:
+            status_placeholder.error(f"Inference error: {e}")
+            st.session_state.running = False
+            render_dashboard()
+            return
+
+        st.session_state.pred_log.append(dict(
+            t=st.session_state.session_t, path_probs=path_probs, fog_seconds=fog_seconds,
+        ))
+        if len(st.session_state.pred_log) > MAX_LOG_LEN:
+            st.session_state.pred_log = st.session_state.pred_log[-MAX_LOG_LEN:]
+
     render_dashboard()
+    if source == "Arduino Cloud (IoT)":
+        badge = '<span class="badge badge-iot">ARDUINO CLOUD</span>'
+    elif st.session_state.example_active:
+        badge = '<span class="badge badge-demo">EXAMPLE</span>'
+    else:
+        badge = '<span class="badge badge-live">LIVE</span>'
+    status_placeholder.markdown(
+        f'{badge}&nbsp;&nbsp;t = {st.session_state.session_t:0.1f}s', unsafe_allow_html=True,
+    )
+
+    if (st.session_state.example_active and st.session_state.example_stop_at is not None
+            and st.session_state.session_t >= st.session_state.example_stop_at):
+        st.session_state.running = False
+        st.session_state.example_active = False
+        status_placeholder.info("Example run complete — 15s synthetic FOG demo finished.")
+
+
+tick_interval = ard_poll_s if source == "Arduino Cloud (IoT)" else (chunk_ms / 1000.0 / max(speed, 0.1))
+tick_interval = max(0.15, tick_interval)  # floor so the UI thread always stays responsive
+st.fragment(run_every=tick_interval)(_live_tick)()
+
+# ─────────────────────────────────────────────────────────────────────────
+# ARDUINO CLOUD SETUP GUIDE
+# ─────────────────────────────────────────────────────────────────────────
+with st.expander("📡 How to connect Arduino Cloud to this dashboard"):
+    st.markdown("""
+**1. In Arduino Cloud** — create a Thing, add a **String** Cloud Variable named
+`emgBatch` (Read & Write), and associate the Thing with your WiFi-capable board
+(this generates `thingProperties.h` with your device's WiFi + auth automatically filled in).
+
+**2. Flash the device** — use `ARDUINO_SKETCH.ino` (included in this project) as a
+starting point. It samples 8 channels at 500 Hz, buffers ~100ms windows, and writes
+each window as one JSON string into `emgBatch`, e.g.
+`{"n":50,"ch":[[...ch1...], [...ch2...], ...]}`. Swap the placeholder `analogRead()`
+calls for your real EMG front-end.
+
+**3. Get API credentials** — in Arduino Cloud, go to your account's **API Keys**
+page and create a Client ID / Client Secret pair (separate from the device's own
+credentials). This app uses them to *poll* your Thing's latest value — Arduino
+Cloud doesn't push webhooks, so polling on a timer is the standard integration path.
+
+**4. Connect it here** — pick **Arduino Cloud (IoT)** as the data source in the
+sidebar, enter the Client ID, Client Secret, and your Thing ID, then hit **Start**.
+For a deployed app, put credentials in `.streamlit/secrets.toml` instead of typing
+them in the UI:
+```toml
+[arduino_cloud]
+client_id = "YOUR_CLIENT_ID"
+client_secret = "YOUR_CLIENT_SECRET"
+```
+
+**Why batching, not raw streaming?** Arduino Cloud stores each variable's *last
+value* and syncs on your device's schedule — it isn't a 500Hz telemetry pipe, and
+polling the REST API 500x/sec would hit rate limits instantly. Buffering ~50-125
+samples per channel into one JSON batch every ~100ms keeps this well within normal
+API usage while still reconstructing the full-rate signal on this end.
+""")

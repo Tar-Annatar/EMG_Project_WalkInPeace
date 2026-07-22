@@ -1,7 +1,7 @@
-streamlit
+streamlit>=1.37
 numpy
 pandas
-plotly
 scipy
-tensorflow-cpu
-protobuf
+plotly
+tensorflow
+requests
