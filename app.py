@@ -22,7 +22,6 @@ from signal_utils import (
     FS, N_CHANNELS, CONDITION_NAMES, TTF_MAX,
     StreamingFeatureExtractor, RunningNormalizer, SyntheticEMGStreamer,
 )
-from arduino_cloud import ArduinoCloudClient, ArduinoCloudError, decode_emg_batch
 
 MAX_LOG_LEN = 1000       # Cap prediction history for smooth browser performance
 DEFAULT_SPEED = 1.0       # Fixed playback speed
@@ -262,9 +261,7 @@ def init_state():
         norm_std=None,
         example_active=False,
         example_stop_at=None,
-        arduino_client=None,
         arduino_status="Disconnected",
-        last_poll_time=None,
         source_mode="Synthetic Demo",
     )
     for k, v in defaults.items():
@@ -279,19 +276,6 @@ init_state()
 if not st.session_state.authenticated:
     login_page()
     st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────
-# ARDUINO HELPER
-# ─────────────────────────────────────────────────────────────────────────
-def get_arduino_credentials():
-    cid, csec = "", ""
-    try:
-        if "arduino_cloud" in st.secrets:
-            cid = st.secrets["arduino_cloud"].get("client_id", "")
-            csec = st.secrets["arduino_cloud"].get("client_secret", "")
-    except Exception:
-        pass
-    return cid, csec
 
 # ─────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -328,46 +312,24 @@ with st.sidebar:
                 freeze_at = st.slider("Freeze occurs at (s)", 10, 60, 25)
     else:
         # ─────────────────────────────────────────────────────────────
-        # ALWAYS-VISIBLE ARDUINO CONNECTOR CARD
+        # ALWAYS-VISIBLE ARDUINO CONNECTOR CARD (UI only — backend removed)
         # ─────────────────────────────────────────────────────────────
         st.markdown('<div class="sidebar-section-title">📡 Arduino IoT Connector</div>', unsafe_allow_html=True)
-        
-        secret_cid, secret_csec = get_arduino_credentials()
-        ard_client_id = st.text_input("Client ID", value=secret_cid, help="From Arduino Cloud -> API Keys")
-        ard_client_secret = st.text_input("Client Secret", value=secret_csec, type="password")
+
+        ard_client_id = st.text_input("Client ID", value="", help="From Arduino Cloud -> API Keys")
+        ard_client_secret = st.text_input("Client Secret", value="", type="password")
         ard_thing_id = st.text_input("Thing ID", help="Found on your Thing's dashboard page")
         ard_var_name = st.text_input("Batch Variable Name", value="emgBatch")
         ard_poll_s = st.slider("Poll Interval (s)", 0.3, 3.0, 0.5, step=0.1)
 
-        # Connection Status Display Container
         with st.container():
             st.markdown("---")
             st.markdown("#### Hardware Status")
-            if st.session_state.arduino_status == "Connected":
-                st.success("🟢 Device Connected (Wi-Fi Active)")
-            elif st.session_state.arduino_status == "Polling":
-                st.warning("🟡 Polling Cloud API...")
-            else:
-                st.error("🔴 Device Disconnected")
-
-            if st.session_state.last_poll_time:
-                st.caption(f"Last Polled: {st.session_state.last_poll_time}")
+            st.error("🔴 Device Disconnected")
+            st.caption("Arduino Cloud connectivity is not available in this build.")
 
             if st.button("⚡ Test Connection", width="stretch"):
-                if not (ard_client_id and ard_client_secret and ard_thing_id):
-                    st.error("Please enter Client ID, Secret, and Thing ID.")
-                else:
-                    with st.spinner("Ping Arduino IoT Cloud..."):
-                        try:
-                            client = ArduinoCloudClient(ard_client_id, ard_client_secret)
-                            client.get_property_value(ard_thing_id, ard_var_name)
-                            st.session_state.arduino_client = client
-                            st.session_state.arduino_status = "Connected"
-                            st.session_state.last_poll_time = time.strftime("%H:%M:%S")
-                            st.success("Connection Successful!")
-                        except Exception as e:
-                            st.session_state.arduino_status = "Disconnected"
-                            st.error(f"Connection Failed: {e}")
+                st.warning("Arduino Cloud connectivity is not available in this build.")
 
     st.markdown('<div class="sidebar-section-title">Controls</div>', unsafe_allow_html=True)
     col_a, col_b, col_c = st.columns(3)
@@ -433,7 +395,6 @@ if stop_clicked:
     st.session_state.running = False
     st.session_state.example_active = False
     st.session_state.example_stop_at = None
-    st.session_state.arduino_status = "Disconnected"
 
 if pause_clicked:
     st.session_state.running = False
@@ -455,18 +416,9 @@ if play_clicked:
                 freeze_at_s=freeze_at if use_freeze else None,
             )
     else:
-        if not (ard_client_id and ard_client_secret and ard_thing_id):
-            status_placeholder.error("Arduino Cloud needs Client ID, Client Secret, and Thing ID.")
-            st.session_state.running = False
-            st.session_state.arduino_status = "Disconnected"
-        else:
-            try:
-                st.session_state.arduino_client = ArduinoCloudClient(ard_client_id, ard_client_secret)
-                st.session_state.arduino_status = "Polling"
-            except Exception as e:
-                status_placeholder.error(f"Could not start Arduino client: {e}")
-                st.session_state.running = False
-                st.session_state.arduino_status = "Disconnected"
+        status_placeholder.error("Arduino Cloud connectivity is not available in this build.")
+        st.session_state.running = False
+        st.session_state.arduino_status = "Disconnected"
 
 if example_clicked:
     st.session_state.extractor = StreamingFeatureExtractor()
@@ -667,44 +619,17 @@ def _live_tick():
     if source == "Synthetic Demo" or st.session_state.example_active:
         chunk_samples = max(1, int(FS * (DEFAULT_CHUNK_MS / 1000.0) * DEFAULT_SPEED))
         chunk = st.session_state.streamer.generate_chunk(chunk_samples)
-    else:  # Arduino Cloud
-        client = st.session_state.arduino_client
-        if client is None:
-            status_placeholder.error("Arduino client not initialized. Click Play again.")
-            st.session_state.running = False
-            st.session_state.arduino_status = "Disconnected"
-            render_dashboard()
-            return
-        try:
-            raw_val = client.get_property_value(ard_thing_id, ard_var_name)
-            chunk = decode_emg_batch(raw_val, n_channels=N_CHANNELS)
-            st.session_state.arduino_status = "Connected"
-            st.session_state.last_poll_time = time.strftime("%H:%M:%S")
+    else:  # Arduino Cloud (UI-only in this build — backend removed)
+        status_placeholder.markdown(
+            '<span class="badge badge-iot">ARDUINO CLOUD</span>&nbsp;'
+            '<span class="badge badge-error">connectivity not available in this build</span>',
+            unsafe_allow_html=True,
+        )
+        st.session_state.running = False
+        st.session_state.arduino_status = "Disconnected"
+        render_dashboard()
+        return
 
-            if chunk is None:
-                status_placeholder.markdown(
-                    '<span class="badge badge-iot">ARDUINO CLOUD</span>&nbsp;'
-                    '<span class="badge badge-paused">waiting for first batch…</span>',
-                    unsafe_allow_html=True,
-                )
-                render_dashboard()
-                return
-        except ArduinoCloudError as e:
-            status_placeholder.markdown(f'<span class="badge badge-error">{e}</span>', unsafe_allow_html=True)
-            st.session_state.running = False
-            st.session_state.arduino_status = "Disconnected"
-            render_dashboard()
-            return
-        except Exception as e:
-            # Catch-all so an unexpected error from the connector never crashes the fragment
-            status_placeholder.markdown(
-                f'<span class="badge badge-error">Unexpected Arduino error: {e}</span>',
-                unsafe_allow_html=True,
-            )
-            st.session_state.running = False
-            st.session_state.arduino_status = "Disconnected"
-            render_dashboard()
-            return
 
     new_slices = st.session_state.extractor.push_samples(chunk)
     st.session_state.session_t += chunk.shape[1] / FS
