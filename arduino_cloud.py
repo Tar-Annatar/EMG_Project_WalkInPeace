@@ -1,32 +1,3 @@
-"""
-arduino_cloud.py — bridges Arduino IoT Cloud to the EMG streaming pipeline.
-
-WHY POLLING (not a webhook)
-----------------------------
-Streamlit Community Cloud apps don't expose a stable public endpoint that
-Arduino Cloud could push a webhook to, and Arduino IoT Cloud doesn't offer
-raw webhook delivery on variable change anyway — the supported integration
-surface is its REST API. So the pattern here is: the Arduino device syncs
-values *up* to Arduino Cloud as usual, and this app *polls* Arduino Cloud's
-REST API on a timer to pull the latest value back down. That's the standard,
-supported way to get Arduino Cloud data into any external app or backend.
-
-WHY BATCHED JSON (not one sample per request)
-------------------------------------------------
-The EMG model needs 500 Hz per channel. Arduino Cloud is a state-sync
-service (it stores each variable's *last value*), not a raw high-frequency
-telemetry pipe, and polling the REST API 500x/sec would blow through rate
-limits instantly. So the Arduino sketch buffers a short window of raw
-samples locally and syncs ONE compact JSON-encoded batch (e.g. 50 samples x
-8 channels every 100 ms) into a single Cloud "String" variable. This module
-polls that variable at the same cadence and unpacks it back into a
-(n_channels, n_samples) array — the exact shape push_samples() expects.
-See ARDUINO_SKETCH.ino for the matching device-side code.
-
-Get credentials: Arduino Cloud → account icon → "API Keys" → create a key
-pair (CLIENT_ID / CLIENT_SECRET, shown once — store it in st.secrets).
-Thing ID: open your Thing in Arduino Cloud, it's in the URL / Thing info panel.
-"""
 import json
 import time
 
