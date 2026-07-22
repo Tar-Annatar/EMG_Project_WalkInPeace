@@ -351,7 +351,7 @@ else:
         unsafe_allow_html=True,
     )
 status_placeholder = st.empty()
-
+status_placeholder.empty()
 # ─────────────────────────────────────────────────────────────────────────
 # PLAY / PAUSE / STOP / EXAMPLE HANDLING
 # ─────────────────────────────────────────────────────────────────────────
