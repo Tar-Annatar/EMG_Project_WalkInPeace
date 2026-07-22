@@ -1,9 +1,8 @@
 """
 EMG Pathology & Freeze-of-Gait Monitor — Streamlit App
 =======================================================
-Public-facing version: Synthetic demo & live Arduino Cloud IoT connection.
-Includes live status badges, manual connection tester, session report export,
-and real-time ML dashboard.
+Public-facing build with real-time ML inference, synthetic playback,
+and an explicit Arduino IoT Cloud connector card with connection testing.
 
 Run locally:
     streamlit run app.py
@@ -266,6 +265,7 @@ def init_state():
         arduino_client=None,
         arduino_status="Disconnected",
         last_poll_time=None,
+        source_mode="Synthetic Demo",
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -308,9 +308,11 @@ with st.sidebar:
         st.rerun()
 
     st.markdown('<div class="sidebar-section-title">Data Source</div>', unsafe_allow_html=True)
+    
     source = st.radio(
         "Source Mode",
         ["Synthetic Demo", "Arduino Cloud (IoT)"],
+        key="source_mode",
         label_visibility="collapsed",
     )
 
@@ -325,41 +327,47 @@ with st.sidebar:
             if inject_freeze:
                 freeze_at = st.slider("Freeze occurs at (s)", 10, 60, 25)
     else:
-        # Arduino IoT Configuration & Status Widget
+        # ─────────────────────────────────────────────────────────────
+        # ALWAYS-VISIBLE ARDUINO CONNECTOR CARD
+        # ─────────────────────────────────────────────────────────────
+        st.markdown('<div class="sidebar-section-title">📡 Arduino IoT Connector</div>', unsafe_allow_html=True)
+        
         secret_cid, secret_csec = get_arduino_credentials()
-        st.caption("Connect live 8-channel hardware stream via Arduino IoT Cloud.")
-        ard_client_id = st.text_input("Client ID", value=secret_cid)
+        ard_client_id = st.text_input("Client ID", value=secret_cid, help="From Arduino Cloud -> API Keys")
         ard_client_secret = st.text_input("Client Secret", value=secret_csec, type="password")
-        ard_thing_id = st.text_input("Thing ID")
-        ard_var_name = st.text_input("Variable Name", value="emgBatch")
+        ard_thing_id = st.text_input("Thing ID", help="Found on your Thing's dashboard page")
+        ard_var_name = st.text_input("Batch Variable Name", value="emgBatch")
         ard_poll_s = st.slider("Poll Interval (s)", 0.3, 3.0, 0.5, step=0.1)
 
-        st.markdown('<div class="sidebar-section-title">Arduino Status</div>', unsafe_allow_html=True)
-        if st.session_state.arduino_status == "Connected":
-            st.success("🟢 Connected (Wi-Fi Active)")
-        elif st.session_state.arduino_status == "Polling":
-            st.warning("🟡 Polling Data...")
-        else:
-            st.error("🔴 Disconnected")
-
-        if st.session_state.last_poll_time:
-            st.caption(f"Last polled: {st.session_state.last_poll_time}")
-
-        if st.button("⚡ Test Connection", width="stretch"):
-            if not (ard_client_id and ard_client_secret and ard_thing_id):
-                st.error("Fill in Client ID, Secret, and Thing ID!")
+        # Connection Status Display Container
+        with st.container():
+            st.markdown("---")
+            st.markdown("#### Hardware Status")
+            if st.session_state.arduino_status == "Connected":
+                st.success("🟢 Device Connected (Wi-Fi Active)")
+            elif st.session_state.arduino_status == "Polling":
+                st.warning("🟡 Polling Cloud API...")
             else:
-                with st.spinner("Connecting to Arduino Cloud..."):
-                    try:
-                        client = ArduinoCloudClient(ard_client_id, ard_client_secret)
-                        client.get_property_value(ard_thing_id, ard_var_name)
-                        st.session_state.arduino_client = client
-                        st.session_state.arduino_status = "Connected"
-                        st.session_state.last_poll_time = time.strftime("%H:%M:%S")
-                        st.success("Board online and communicating!")
-                    except Exception as e:
-                        st.session_state.arduino_status = "Disconnected"
-                        st.error(f"Connection failed: {e}")
+                st.error("🔴 Device Disconnected")
+
+            if st.session_state.last_poll_time:
+                st.caption(f"Last Polled: {st.session_state.last_poll_time}")
+
+            if st.button("⚡ Test Connection", width="stretch"):
+                if not (ard_client_id and ard_client_secret and ard_thing_id):
+                    st.error("Please enter Client ID, Secret, and Thing ID.")
+                else:
+                    with st.spinner("Ping Arduino IoT Cloud..."):
+                        try:
+                            client = ArduinoCloudClient(ard_client_id, ard_client_secret)
+                            client.get_property_value(ard_thing_id, ard_var_name)
+                            st.session_state.arduino_client = client
+                            st.session_state.arduino_status = "Connected"
+                            st.session_state.last_poll_time = time.strftime("%H:%M:%S")
+                            st.success("Connection Successful!")
+                        except Exception as e:
+                            st.session_state.arduino_status = "Disconnected"
+                            st.error(f"Connection Failed: {e}")
 
     st.markdown('<div class="sidebar-section-title">Controls</div>', unsafe_allow_html=True)
     col_a, col_b, col_c = st.columns(3)
